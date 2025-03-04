@@ -173,171 +173,137 @@ impl<
         let mut parent_updates = Vec::new();
 
         loop {
-            if !self.store.has(current_key) {
-                // We reached a non-existent node, create a new page here
-                let new_page_key =
-                    self.create_single_item_page(level, None, item_key, item_value, None);
+            // Try to take ownership of the page instead of cloning when possible
+            let current_page_opt = if parent_updates.is_empty() {
+                // For the root, we'll need to remove it since we're modifying the tree structure
+                self.store.remove(current_key)
+            } else {
+                // For non-root nodes, just get a reference first
+                self.store.get(current_key).cloned()
+            };
 
-                // Update parent chain from bottom up
-                self.root = self.update_parent_chain(new_page_key, parent_updates);
-                return self.root;
-            }
+            match current_page_opt {
+                None => {
+                    // We reached a non-existent node, create a new page here
+                    let new_page_key =
+                        self.create_single_item_page(level, None, item_key, item_value, None);
 
-            let current_page = self.store.get(current_key).unwrap().clone();
+                    // Update parent chain from bottom up
+                    self.root = self.update_parent_chain(new_page_key, parent_updates);
+                    return self.root;
+                }
+                Some(current_page) => {
+                    // Handle based on level comparison
+                    if current_page.level < level {
+                        // Current node is at a lower level than our item - need to create a new node at higher level
 
-            // Handle based on level comparison
-            if current_page.level < level {
-                // Current node is at a lower level than our item - need to create a new node at higher level
+                        // Store the current page under its hash
+                        let existing_page_key = hash_page(&current_page);
+                        self.store.put(existing_page_key, current_page);
 
-                // First, preserve the existing page
-                let existing_page = Page {
-                    level: current_page.level,
-                    low: current_page.low,
-                    list: current_page.list.clone(),
-                };
+                        // Split the tree at our insertion point
+                        let (low_key, high_key) = self.split(Some(existing_page_key), item_key);
 
-                let existing_page_key = hash_page(&existing_page);
-                self.store.put(existing_page_key, existing_page);
-
-                // Split the tree at our insertion point
-                let (low_key, high_key) = self.split(Some(existing_page_key), item_key);
-
-                // Create a new page at the higher level with our item between the split parts
-                let new_page_key =
-                    self.create_single_item_page(level, low_key, item_key, item_value, high_key);
-
-                // Update parent chain from bottom up
-                self.root = self.update_parent_chain(new_page_key, parent_updates);
-                return self.root;
-            } else if current_page.level == level {
-                // Found a page at the same level as our item - insert directly here
-                let mut new_list = Vec::new();
-
-                // Handle empty list case
-                if current_page.list.is_empty() {
-                    new_list.push(PageData {
-                        key: item_key,
-                        value: item_value,
-                        next: None,
-                    });
-                } else {
-                    let first_key = current_page.list[0].key;
-
-                    if Value::compare_keys(&item_key, &first_key) == Ordering::Less {
-                        // Item belongs before the first element
-                        let (low2a, low2b) = self.split(current_page.low, item_key);
-
-                        new_list.push(PageData {
-                            key: item_key,
-                            value: item_value,
-                            next: low2b,
-                        });
-
-                        // Add existing items
-                        for entry in &current_page.list {
-                            new_list.push(entry.clone());
-                        }
-
-                        let new_page = Page {
-                            level: current_page.level,
-                            low: low2a,
-                            list: new_list,
-                        };
-
-                        let new_page_key = hash_page(&new_page);
-                        self.store.put(new_page_key, new_page);
+                        // Create a new page at the higher level with our item between the split parts
+                        let new_page_key = self.create_single_item_page(
+                            level, low_key, item_key, item_value, high_key,
+                        );
 
                         // Update parent chain from bottom up
-                        let mut child_key = new_page_key;
-                        while let Some((parent_key, update_type)) = parent_updates.pop() {
-                            let mut parent_page = self.store.get(parent_key).unwrap().clone();
-
-                            match update_type {
-                                UpdateType::Low => parent_page.low = Some(child_key),
-                                UpdateType::Next(idx) => {
-                                    parent_page.list[idx].next = Some(child_key)
-                                }
-                            }
-
-                            let new_parent_key = hash_page(&parent_page);
-                            self.store.put(new_parent_key, parent_page);
-                            child_key = new_parent_key;
-                        }
-
-                        // Set the root to the top of our updated chain
-                        self.root = child_key;
-                        return child_key;
-                    } else {
-                        // Item belongs after the first element - use helper for this case
-                        let new_list =
-                            self.insert_after_first(&current_page.list, item_key, item_value);
-
-                        let new_page = Page {
+                        self.root = self.update_parent_chain(new_page_key, parent_updates);
+                        return self.root;
+                    } else if current_page.level == level {
+                        // Found a page at the same level as our item - insert directly here
+                        let mut new_page = Page {
                             level: current_page.level,
                             low: current_page.low,
-                            list: new_list,
+                            list: Vec::new(),
                         };
+
+                        // Handle empty list case
+                        if current_page.list.is_empty() {
+                            new_page.list.push(PageData {
+                                key: item_key,
+                                value: item_value,
+                                next: None,
+                            });
+                        } else {
+                            let first_key = current_page.list[0].key;
+
+                            if Value::compare_keys(&item_key, &first_key) == Ordering::Less {
+                                // Item belongs before the first element
+                                let (low2a, low2b) = self.split(current_page.low, item_key);
+
+                                // Create new list starting with our item
+                                let mut new_list = Vec::with_capacity(current_page.list.len() + 1);
+                                new_list.push(PageData {
+                                    key: item_key,
+                                    value: item_value,
+                                    next: low2b,
+                                });
+
+                                // Move existing items instead of cloning
+                                new_list.extend(current_page.list);
+                                new_page.list = new_list;
+                                new_page.low = low2a;
+                            } else {
+                                // Item belongs after the first element - use helper for this case
+                                new_page.list = self.insert_after_first(
+                                    &current_page.list,
+                                    item_key,
+                                    item_value,
+                                );
+                            }
+                        }
 
                         let new_page_key = hash_page(&new_page);
                         self.store.put(new_page_key, new_page);
 
                         // Update parent chain from bottom up
-                        let mut child_key = new_page_key;
-                        while let Some((parent_key, update_type)) = parent_updates.pop() {
-                            let mut parent_page = self.store.get(parent_key).unwrap().clone();
+                        self.root = self.update_parent_chain(new_page_key, parent_updates);
+                        return self.root;
+                    } else {
+                        // We need to keep this page, so put it back in the store if we removed it
+                        if parent_updates.is_empty() {
+                            self.store.put(current_key, current_page.clone());
+                        }
 
-                            match update_type {
-                                UpdateType::Low => parent_page.low = Some(child_key),
-                                UpdateType::Next(idx) => {
-                                    parent_page.list[idx].next = Some(child_key)
+                        // Current page is at a higher level - navigate down the tree
+                        if current_page.list.is_empty() {
+                            // Navigate through low child
+                            parent_updates.push((current_key, UpdateType::Low));
+                            current_key = current_page.low.unwrap_or_default();
+                            continue;
+                        }
+
+                        let first_key = current_page.list[0].key;
+
+                        if Value::compare_keys(&item_key, &first_key) == Ordering::Less {
+                            // Key is less than first entry - go to low child
+                            parent_updates.push((current_key, UpdateType::Low));
+                            current_key = current_page.low.unwrap_or_default();
+                        } else {
+                            // Find the appropriate next pointer to follow
+                            let mut found = false;
+                            for i in 1..current_page.list.len() {
+                                if Value::compare_keys(&item_key, &current_page.list[i].key)
+                                    == Ordering::Less
+                                {
+                                    // Key belongs between entries i-1 and i
+                                    parent_updates.push((current_key, UpdateType::Next(i - 1)));
+                                    current_key = current_page.list[i - 1].next.unwrap_or_default();
+                                    found = true;
+                                    break;
                                 }
                             }
 
-                            let new_parent_key = hash_page(&parent_page);
-                            self.store.put(new_parent_key, parent_page);
-                            child_key = new_parent_key;
+                            if !found {
+                                // Key is greater than all entries - follow last entry's next pointer
+                                let last_idx = current_page.list.len() - 1;
+                                parent_updates.push((current_key, UpdateType::Next(last_idx)));
+                                current_key = current_page.list[last_idx].next.unwrap_or_default();
+                            }
                         }
-
-                        // Set the root to the top of our updated chain
-                        self.root = child_key;
-                        return child_key;
-                    }
-                }
-            } else {
-                // Current page is at a higher level - navigate down the tree
-                if current_page.list.is_empty() {
-                    // Navigate through low child
-                    parent_updates.push((current_key, UpdateType::Low));
-                    current_key = current_page.low.unwrap_or_default();
-                    continue;
-                }
-
-                let first_key = current_page.list[0].key;
-
-                if Value::compare_keys(&item_key, &first_key) == Ordering::Less {
-                    // Key is less than first entry - go to low child
-                    parent_updates.push((current_key, UpdateType::Low));
-                    current_key = current_page.low.unwrap_or_default();
-                } else {
-                    // Find the appropriate next pointer to follow
-                    let mut found = false;
-                    for i in 1..current_page.list.len() {
-                        if Value::compare_keys(&item_key, &current_page.list[i].key)
-                            == Ordering::Less
-                        {
-                            // Key belongs between entries i-1 and i
-                            parent_updates.push((current_key, UpdateType::Next(i - 1)));
-                            current_key = current_page.list[i - 1].next.unwrap_or_default();
-                            found = true;
-                            break;
-                        }
-                    }
-
-                    if !found {
-                        // Key is greater than all entries - follow last entry's next pointer
-                        let last_idx = current_page.list.len() - 1;
-                        parent_updates.push((current_key, UpdateType::Next(last_idx)));
-                        current_key = current_page.list[last_idx].next.unwrap_or_default();
                     }
                 }
             }
@@ -355,13 +321,12 @@ impl<
             return Vec::new();
         }
 
-        let mut result_entries = Vec::new();
-        // Create a copy of entries (unnecessary if the entries are Copy)
-        let current_entries = entries.to_vec();
+        let mut result_entries = Vec::with_capacity(entries.len() + 1);
+        // Use entries directly since we now own them
         let mut current_idx = 0;
 
-        while current_idx < current_entries.len() {
-            let entry = &current_entries[current_idx];
+        while current_idx < entries.len() {
+            let entry = &entries[current_idx];
 
             match Value::compare_keys(&entry.key, &item_key) {
                 Ordering::Equal => {
@@ -373,14 +338,14 @@ impl<
                         next: entry.next,
                     });
                     // Append the rest of the entries
-                    for i in (current_idx + 1)..current_entries.len() {
-                        result_entries.push(current_entries[i].clone());
+                    for i in (current_idx + 1)..entries.len() {
+                        result_entries.push(entries[i].clone());
                     }
                     break;
                 }
                 Ordering::Less => {
-                    if current_idx == current_entries.len() - 1
-                        || Value::compare_keys(&item_key, &current_entries[current_idx + 1].key)
+                    if current_idx == entries.len() - 1
+                        || Value::compare_keys(&item_key, &entries[current_idx + 1].key)
                             == Ordering::Less
                     {
                         // Insert between current entry and next entry
@@ -396,13 +361,13 @@ impl<
                             next: right_subtree,
                         });
                         // Append the rest
-                        for i in (current_idx + 1)..current_entries.len() {
-                            result_entries.push(current_entries[i].clone());
+                        for i in (current_idx + 1)..entries.len() {
+                            result_entries.push(entries[i].clone());
                         }
                         break;
                     } else {
                         // Not the right spot yet, keep current entry and continue
-                        result_entries.push(entry.clone());
+                        result_entries.push(entries[current_idx].clone());
                         current_idx += 1;
                     }
                 }
@@ -729,16 +694,25 @@ impl<
         let mut current_child_key = child_key;
 
         for (parent_key, update_type) in parent_updates.into_iter().rev() {
-            let mut parent_page = self.store.get(parent_key).unwrap().clone();
+            match self.store.get(parent_key).cloned() {
+                Some(mut parent_page) => {
+                    match update_type {
+                        UpdateType::Low => parent_page.low = Some(current_child_key),
+                        UpdateType::Next(idx) => {
+                            parent_page.list[idx].next = Some(current_child_key)
+                        }
+                    }
 
-            match update_type {
-                UpdateType::Low => parent_page.low = Some(current_child_key),
-                UpdateType::Next(idx) => parent_page.list[idx].next = Some(current_child_key),
+                    let new_parent_key = hash_page(&parent_page);
+                    self.store.put(new_parent_key, parent_page);
+                    current_child_key = new_parent_key;
+                }
+                None => {
+                    // This should not happen in normal operation, but we handle it gracefully
+                    // by continuing with the current child key
+                    continue;
+                }
             }
-
-            let new_parent_key = hash_page(&parent_page);
-            self.store.put(new_parent_key, parent_page);
-            current_child_key = new_parent_key;
         }
 
         current_child_key

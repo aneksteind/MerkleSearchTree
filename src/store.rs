@@ -41,8 +41,8 @@ impl<Key: AsRef<[u8]> + Eq + Hash + Copy, Value: Reference<Key = Key>> Store<Key
         self.pages.contains_key(&key)
     }
 
-    pub fn remove(&mut self, key: Key) {
-        self.pages.remove(&key);
+    pub fn remove(&mut self, key: Key) -> Option<Value> {
+        self.pages.remove(&key)
     }
 
     pub fn missing_set(&self, root: Key) -> HashSet<Key> {
