@@ -105,7 +105,7 @@ impl<
         self.store.get(page_key)
     }
 
-    /// Converts the tree to a sorted list of values using in-order traversal.
+    /// Converts the tree to a sorted list of values using MST-specific traversal.
     ///
     /// # Example
     /// ```
