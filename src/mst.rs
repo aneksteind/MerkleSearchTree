@@ -28,15 +28,6 @@ pub struct MST<Value: Hash + std::fmt::Debug + KeyComparable<Key = MSTKey>> {
     pub store: Store<MSTKey, Page<MSTKey, Value>>,
 }
 
-/// Represents the type of update needed when modifying the tree structure
-#[derive(Debug)]
-enum UpdateType {
-    /// Update the low child pointer
-    Low,
-    /// Update the next pointer at the specified index
-    Next(usize),
-}
-
 impl<
     Value: AsRef<[u8]>
         + Hash
@@ -140,14 +131,6 @@ impl<
     /// The insertion process maintains the tree's ordered structure and balance.
     /// If the key already exists, the values will be merged using the `Merge` trait.
     ///
-    /// # How it works
-    /// 1. For empty trees: Creates a new root node with the item
-    /// 2. For existing trees:
-    ///    - Navigates to the correct position based on key comparison
-    ///    - Creates or updates nodes as needed
-    ///    - Rebalances the tree if necessary
-    ///    - Updates all node hash values to maintain content integrity
-    ///
     /// # Example
     /// ```
     /// use mst::{MST, MSTKey};
@@ -156,202 +139,268 @@ impl<
     /// let mut mst: MST<TestValue> = MST::new();
     /// let key = MSTKey::default();
     /// let value = TestValue { key, data: [0; 4] };
-    /// let new_root = mst.insert(key, value);
+    /// mst.insert(key, value);
     /// ```
     pub fn insert(&mut self, item_key: MSTKey, item_value: Value) -> MSTKey {
         let level = calc_level(&item_key);
+        let (new_root, _) = self.insert_at(self.root, item_key, item_value, level);
+        self.root = new_root;
+        self.root
+    }
 
-        // If tree is empty or root doesn't exist, create new root
-        if self.root == MSTKey::default() || !self.store.has(self.root) {
-            self.root = self.create_single_item_page(level, None, item_key, item_value, None);
-            return self.root;
+    /// Helper function that recursively inserts an item at the specified level.
+    /// Returns the new root key of the affected subtree and any modified store.
+    fn insert_at(
+        &mut self,
+        current_root: MSTKey,
+        item_key: MSTKey,
+        item_value: Value,
+        level: u32,
+    ) -> (MSTKey, bool) {
+        // Handle empty tree or non-existent root
+        if current_root == MSTKey::default() || !self.store.has(current_root) {
+            let new_page = Page {
+                level,
+                low: None,
+                list: vec![PageData {
+                    key: item_key,
+                    value: item_value,
+                    next: None,
+                }],
+            };
+            let new_key = hash_page(&new_page);
+            self.store.put(new_key, new_page);
+            return (new_key, true);
         }
 
-        // Start traversal from the root
-        let mut current_key = self.root;
-        // Track parent nodes that need updating after insertion
-        let mut parent_updates = Vec::new();
+        // Get the current page
+        let current_page = self.store.get(current_root).cloned().unwrap();
 
-        loop {
-            let current_page_opt = if parent_updates.is_empty() {
-                // For the root, we'll need to remove it since we're modifying the tree structure
-                self.store.remove(current_key)
-            } else {
-                self.store.get(current_key).cloned()
+        // Case 1: Current level is less than item level
+        if current_page.level < level {
+            // We need to create a new node at a higher level
+            // First split the tree at our insertion point
+            let (low_key, high_key) = self.split(Some(current_root), item_key);
+
+            // Create a new page with our item between the split parts
+            let new_page = Page {
+                level,
+                low: low_key,
+                list: vec![PageData {
+                    key: item_key,
+                    value: item_value,
+                    next: high_key,
+                }],
+            };
+            let new_key = hash_page(&new_page);
+            self.store.put(new_key, new_page);
+            return (new_key, true);
+        }
+        // Case 2: Current level is equal to item level
+        else if current_page.level == level {
+            let mut new_page = Page {
+                level: current_page.level,
+                low: current_page.low,
+                list: Vec::with_capacity(current_page.list.len() + 1),
             };
 
-            match current_page_opt {
-                None => {
-                    // We reached a non-existent node, create a new page here
-                    let new_page_key =
-                        self.create_single_item_page(level, None, item_key, item_value, None);
+            // Handle empty list case
+            if current_page.list.is_empty() {
+                new_page.list.push(PageData {
+                    key: item_key,
+                    value: item_value,
+                    next: None,
+                });
+            } else {
+                let first_key = current_page.list[0].key;
 
-                    // Update parent chain from bottom up
-                    self.root = self.update_parent_chain(new_page_key, parent_updates);
-                    return self.root;
+                if Value::compare_keys(&item_key, &first_key) == Ordering::Less {
+                    // Item belongs before the first element
+                    let (low2a, low2b) = self.split(current_page.low, item_key);
+
+                    // Create new list starting with our item
+                    new_page.list.push(PageData {
+                        key: item_key,
+                        value: item_value,
+                        next: low2b,
+                    });
+
+                    // Add the rest of the original list
+                    new_page.list.extend(current_page.list);
+                    new_page.low = low2a;
+                } else {
+                    // Item belongs after the first element
+                    new_page.list =
+                        self.insert_after_first(&current_page.list, item_key, item_value);
                 }
-                Some(current_page) => {
-                    // Handle based on level comparison
-                    if current_page.level < level {
-                        // Current node is at a lower level than our item - need to create a new node at higher level
+            }
 
-                        // Store the current page under its hash
-                        let existing_page_key = hash_page(&current_page);
-                        self.store.put(existing_page_key, current_page);
-
-                        // Split the tree at our insertion point
-                        let (low_key, high_key) = self.split(Some(existing_page_key), item_key);
-
-                        // Create a new page at the higher level with our item between the split parts
-                        let new_page_key = self.create_single_item_page(
-                            level, low_key, item_key, item_value, high_key,
-                        );
-
-                        // Update parent chain from bottom up
-                        self.root = self.update_parent_chain(new_page_key, parent_updates);
-                        return self.root;
-                    } else if current_page.level == level {
-                        // Found a page at the same level as our item - insert directly here
-                        let mut new_page = Page {
-                            level: current_page.level,
-                            low: current_page.low,
-                            list: Vec::new(),
-                        };
-
-                        // Handle empty list case
-                        if current_page.list.is_empty() {
-                            new_page.list.push(PageData {
+            let new_key = hash_page(&new_page);
+            self.store.put(new_key, new_page);
+            return (new_key, true);
+        }
+        // Case 3: Current level is greater than item level
+        else {
+            if current_page.list.is_empty() {
+                // No items in this node, insert into low child
+                let low_key = current_page.low;
+                let (new_low_key, low_modified) = match low_key {
+                    Some(key) => self.insert_at(key, item_key, item_value, level),
+                    None => {
+                        // Create a new page for the item
+                        let new_page = Page {
+                            level,
+                            low: None,
+                            list: vec![PageData {
                                 key: item_key,
                                 value: item_value,
                                 next: None,
-                            });
-                        } else {
-                            let first_key = current_page.list[0].key;
-
-                            if Value::compare_keys(&item_key, &first_key) == Ordering::Less {
-                                // Item belongs before the first element
-                                let (low2a, low2b) = self.split(current_page.low, item_key);
-
-                                // Create new list starting with our item
-                                let mut new_list = Vec::with_capacity(current_page.list.len() + 1);
-                                new_list.push(PageData {
-                                    key: item_key,
-                                    value: item_value,
-                                    next: low2b,
-                                });
-
-                                new_list.extend(current_page.list);
-                                new_page.list = new_list;
-                                new_page.low = low2a;
-                            } else {
-                                // Item belongs after the first element - use helper for this case
-                                new_page.list = self.insert_after_first(
-                                    &current_page.list,
-                                    item_key,
-                                    item_value,
-                                );
-                            }
-                        }
-
-                        let new_page_key = hash_page(&new_page);
-                        self.store.put(new_page_key, new_page);
-
-                        // Update parent chain from bottom up
-                        self.root = self.update_parent_chain(new_page_key, parent_updates);
-                        return self.root;
-                    } else {
-                        // We need to keep this page, so put it back in the store if we removed it
-                        if parent_updates.is_empty() {
-                            self.store.put(current_key, current_page.clone());
-                        }
-
-                        // Current page is at a higher level - navigate down the tree
-                        if current_page.list.is_empty() {
-                            // Navigate through low child
-                            parent_updates.push((current_key, UpdateType::Low));
-
-                            // Check if low pointer exists
-                            if let Some(low_key) = current_page.low {
-                                current_key = low_key;
-                                continue;
-                            } else {
-                                // No low child exists, create a new page here
-                                let new_page_key = self.create_single_item_page(
-                                    level, None, item_key, item_value, None,
-                                );
-                                self.root = self.update_parent_chain(new_page_key, parent_updates);
-                                return self.root;
-                            }
-                        }
-
-                        let first_key = current_page.list[0].key;
-
-                        if Value::compare_keys(&item_key, &first_key) == Ordering::Less {
-                            // Key is less than first entry - go to low child
-                            parent_updates.push((current_key, UpdateType::Low));
-
-                            // Check if low pointer exists
-                            if let Some(low_key) = current_page.low {
-                                current_key = low_key;
-                            } else {
-                                // No low child exists, create a new page here
-                                let new_page_key = self.create_single_item_page(
-                                    level, None, item_key, item_value, None,
-                                );
-                                self.root = self.update_parent_chain(new_page_key, parent_updates);
-                                return self.root;
-                            }
-                        } else {
-                            // Find the appropriate next pointer to follow
-                            let mut found = false;
-                            for i in 1..current_page.list.len() {
-                                if Value::compare_keys(&item_key, &current_page.list[i].key)
-                                    == Ordering::Less
-                                {
-                                    // Key belongs between entries i-1 and i
-                                    parent_updates.push((current_key, UpdateType::Next(i - 1)));
-
-                                    // Check if next pointer exists
-                                    if let Some(next_key) = current_page.list[i - 1].next {
-                                        current_key = next_key;
-                                    } else {
-                                        // No next child exists, create a new page here
-                                        let new_page_key = self.create_single_item_page(
-                                            level, None, item_key, item_value, None,
-                                        );
-                                        self.root =
-                                            self.update_parent_chain(new_page_key, parent_updates);
-                                        return self.root;
-                                    }
-
-                                    found = true;
-                                    break;
-                                }
-                            }
-
-                            if !found {
-                                // Key is greater than all entries - follow last entry's next pointer
-                                let last_idx = current_page.list.len() - 1;
-                                parent_updates.push((current_key, UpdateType::Next(last_idx)));
-
-                                // Check if next pointer exists
-                                if let Some(next_key) = current_page.list[last_idx].next {
-                                    current_key = next_key;
-                                } else {
-                                    // No next child exists, create a new page here
-                                    let new_page_key = self.create_single_item_page(
-                                        level, None, item_key, item_value, None,
-                                    );
-                                    self.root =
-                                        self.update_parent_chain(new_page_key, parent_updates);
-                                    return self.root;
-                                }
-                            }
-                        }
+                            }],
+                        };
+                        let new_key = hash_page(&new_page);
+                        self.store.put(new_key, new_page);
+                        (new_key, true)
                     }
+                };
+
+                // Only create a new page if the child was modified
+                if low_modified {
+                    let mut new_page = current_page.clone();
+                    new_page.low = Some(new_low_key);
+                    let new_key = hash_page(&new_page);
+                    self.store.put(new_key, new_page);
+                    return (new_key, true);
+                } else {
+                    return (current_root, false);
+                }
+            }
+
+            let first_key = current_page.list[0].key;
+
+            if Value::compare_keys(&item_key, &first_key) == Ordering::Less {
+                // Key is less than first entry - go to low child
+                let low_key = current_page.low;
+                let (new_low_key, low_modified) = match low_key {
+                    Some(key) => self.insert_at(key, item_key, item_value, level),
+                    None => {
+                        // Create a new page for the item
+                        let new_page = Page {
+                            level,
+                            low: None,
+                            list: vec![PageData {
+                                key: item_key,
+                                value: item_value,
+                                next: None,
+                            }],
+                        };
+                        let new_key = hash_page(&new_page);
+                        self.store.put(new_key, new_page);
+                        (new_key, true)
+                    }
+                };
+
+                // Only create a new page if the child was modified
+                if low_modified {
+                    let mut new_page = current_page.clone();
+                    new_page.low = Some(new_low_key);
+                    let new_key = hash_page(&new_page);
+                    self.store.put(new_key, new_page);
+                    return (new_key, true);
+                } else {
+                    return (current_root, false);
+                }
+            } else {
+                // Find where the item belongs in the list
+                let mut new_page = current_page.clone();
+                let modified =
+                    self.insert_into_list(&mut new_page.list, item_key, item_value, level);
+
+                // Only create a new page if a child was modified
+                if modified {
+                    let new_key = hash_page(&new_page);
+                    self.store.put(new_key, new_page);
+                    return (new_key, true);
+                } else {
+                    return (current_root, false);
                 }
             }
         }
+    }
+
+    /// Helper function to insert an item into the right position in a list
+    /// Returns true if any modifications were made
+    fn insert_into_list(
+        &mut self,
+        list: &mut Vec<PageData<MSTKey, Value>>,
+        item_key: MSTKey,
+        item_value: Value,
+        level: u32,
+    ) -> bool {
+        for i in 0..list.len() {
+            // Check if the item belongs before this entry
+            if i < list.len() - 1
+                && Value::compare_keys(&item_key, &list[i + 1].key) == Ordering::Less
+            {
+                // Item belongs between entries i and i+1
+                let next_key = list[i].next;
+                let (new_next_key, next_modified) = match next_key {
+                    Some(key) => self.insert_at(key, item_key, item_value, level),
+                    None => {
+                        // Create a new page for the item
+                        let new_page = Page {
+                            level,
+                            low: None,
+                            list: vec![PageData {
+                                key: item_key,
+                                value: item_value,
+                                next: None,
+                            }],
+                        };
+                        let new_key = hash_page(&new_page);
+                        self.store.put(new_key, new_page);
+                        (new_key, true)
+                    }
+                };
+
+                // Only update the list if the child was modified
+                if next_modified {
+                    list[i].next = Some(new_next_key);
+                    return true;
+                } else {
+                    return false;
+                }
+            }
+        }
+
+        // If we get here, the item belongs after the last entry
+        let last_idx = list.len() - 1;
+        let next_key = list[last_idx].next;
+        let (new_next_key, next_modified) = match next_key {
+            Some(key) => self.insert_at(key, item_key, item_value, level),
+            None => {
+                // Create a new page for the item
+                let new_page = Page {
+                    level,
+                    low: None,
+                    list: vec![PageData {
+                        key: item_key,
+                        value: item_value,
+                        next: None,
+                    }],
+                };
+                let new_key = hash_page(&new_page);
+                self.store.put(new_key, new_page);
+                (new_key, true)
+            }
+        };
+
+        // Only update the list if the child was modified
+        if next_modified {
+            list[last_idx].next = Some(new_next_key);
+            return true;
+        }
+
+        false
     }
 
     /// Helper function to insert a key-value pair after the first entry in a list
@@ -366,7 +415,6 @@ impl<
         }
 
         let mut result_entries = Vec::with_capacity(entries.len() + 1);
-        // Use entries directly since we now own them
         let mut current_idx = 0;
 
         while current_idx < entries.len() {
@@ -396,7 +444,7 @@ impl<
                         let (left_subtree, right_subtree) = self.split(entry.next, item_key);
                         result_entries.push(PageData {
                             key: entry.key,
-                            value: entry.value,
+                            value: entry.value.clone(),
                             next: left_subtree,
                         });
                         result_entries.push(PageData {
@@ -729,39 +777,6 @@ impl<
         output
     }
 
-    /// Updates a chain of parent nodes and returns the new root key
-    fn update_parent_chain(
-        &mut self,
-        child_key: MSTKey,
-        parent_updates: Vec<(MSTKey, UpdateType)>,
-    ) -> MSTKey {
-        let mut current_child_key = child_key;
-
-        for (parent_key, update_type) in parent_updates.into_iter().rev() {
-            match self.store.get(parent_key).cloned() {
-                Some(mut parent_page) => {
-                    match update_type {
-                        UpdateType::Low => parent_page.low = Some(current_child_key),
-                        UpdateType::Next(idx) => {
-                            parent_page.list[idx].next = Some(current_child_key)
-                        }
-                    }
-
-                    let new_parent_key = hash_page(&parent_page);
-                    self.store.put(new_parent_key, parent_page);
-                    current_child_key = new_parent_key;
-                }
-                None => {
-                    // This should not happen in normal operation, but we handle it gracefully
-                    // by continuing with the current child key
-                    continue;
-                }
-            }
-        }
-
-        current_child_key
-    }
-
     /// Creates and stores a page, returning its key
     fn create_and_store_page(
         &mut self,
@@ -774,19 +789,6 @@ impl<
         let new_page_key = hash_page(&new_page);
         self.store.put(new_page_key, new_page);
         new_page_key
-    }
-
-    /// Creates a page with a single item
-    fn create_single_item_page(
-        &mut self,
-        level: u32,
-        low: Option<MSTKey>,
-        key: MSTKey,
-        value: Value,
-        next: Option<MSTKey>,
-    ) -> MSTKey {
-        let page_data = PageData { key, value, next };
-        self.create_and_store_page(level, low, vec![page_data])
     }
 
     /// General-purpose tree traversal method that can be used by multiple functions
