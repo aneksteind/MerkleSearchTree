@@ -177,7 +177,6 @@ impl<
                 // For the root, we'll need to remove it since we're modifying the tree structure
                 self.store.remove(current_key)
             } else {
-                // For non-root nodes, just get a reference first
                 self.store.get(current_key).cloned()
             };
 
@@ -241,7 +240,6 @@ impl<
                                     next: low2b,
                                 });
 
-                                // Move existing items instead of cloning
                                 new_list.extend(current_page.list);
                                 new_page.list = new_list;
                                 new_page.low = low2a;
@@ -271,8 +269,19 @@ impl<
                         if current_page.list.is_empty() {
                             // Navigate through low child
                             parent_updates.push((current_key, UpdateType::Low));
-                            current_key = current_page.low.unwrap_or_default();
-                            continue;
+
+                            // Check if low pointer exists
+                            if let Some(low_key) = current_page.low {
+                                current_key = low_key;
+                                continue;
+                            } else {
+                                // No low child exists, create a new page here
+                                let new_page_key = self.create_single_item_page(
+                                    level, None, item_key, item_value, None,
+                                );
+                                self.root = self.update_parent_chain(new_page_key, parent_updates);
+                                return self.root;
+                            }
                         }
 
                         let first_key = current_page.list[0].key;
@@ -280,7 +289,18 @@ impl<
                         if Value::compare_keys(&item_key, &first_key) == Ordering::Less {
                             // Key is less than first entry - go to low child
                             parent_updates.push((current_key, UpdateType::Low));
-                            current_key = current_page.low.unwrap_or_default();
+
+                            // Check if low pointer exists
+                            if let Some(low_key) = current_page.low {
+                                current_key = low_key;
+                            } else {
+                                // No low child exists, create a new page here
+                                let new_page_key = self.create_single_item_page(
+                                    level, None, item_key, item_value, None,
+                                );
+                                self.root = self.update_parent_chain(new_page_key, parent_updates);
+                                return self.root;
+                            }
                         } else {
                             // Find the appropriate next pointer to follow
                             let mut found = false;
@@ -290,7 +310,20 @@ impl<
                                 {
                                     // Key belongs between entries i-1 and i
                                     parent_updates.push((current_key, UpdateType::Next(i - 1)));
-                                    current_key = current_page.list[i - 1].next.unwrap_or_default();
+
+                                    // Check if next pointer exists
+                                    if let Some(next_key) = current_page.list[i - 1].next {
+                                        current_key = next_key;
+                                    } else {
+                                        // No next child exists, create a new page here
+                                        let new_page_key = self.create_single_item_page(
+                                            level, None, item_key, item_value, None,
+                                        );
+                                        self.root =
+                                            self.update_parent_chain(new_page_key, parent_updates);
+                                        return self.root;
+                                    }
+
                                     found = true;
                                     break;
                                 }
@@ -300,7 +333,19 @@ impl<
                                 // Key is greater than all entries - follow last entry's next pointer
                                 let last_idx = current_page.list.len() - 1;
                                 parent_updates.push((current_key, UpdateType::Next(last_idx)));
-                                current_key = current_page.list[last_idx].next.unwrap_or_default();
+
+                                // Check if next pointer exists
+                                if let Some(next_key) = current_page.list[last_idx].next {
+                                    current_key = next_key;
+                                } else {
+                                    // No next child exists, create a new page here
+                                    let new_page_key = self.create_single_item_page(
+                                        level, None, item_key, item_value, None,
+                                    );
+                                    self.root =
+                                        self.update_parent_chain(new_page_key, parent_updates);
+                                    return self.root;
+                                }
                             }
                         }
                     }
