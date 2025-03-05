@@ -173,7 +173,6 @@ impl<
         let mut parent_updates = Vec::new();
 
         loop {
-            // Try to take ownership of the page instead of cloning when possible
             let current_page_opt = if parent_updates.is_empty() {
                 // For the root, we'll need to remove it since we're modifying the tree structure
                 self.store.remove(current_key)
